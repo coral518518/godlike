@@ -1,0 +1,12 @@
+# Godlike 自动续期脚本 - Python 依赖
+# 登录版 (main.py)
+requests>=2.28.0
+playwright>=1.40.0
+pynacl>=1.5.0
+websockets>=11.0
+
+# 外链版 (renew.py) - 额外依赖
+DrissionPage>=4.0.0
+xvfbwrapper>=0.2.9
+SpeechRecognition>=3.10.0
+pydub>=0.25.1
