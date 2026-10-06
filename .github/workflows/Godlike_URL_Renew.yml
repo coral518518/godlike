@@ -3,7 +3,7 @@ name: Godlike URL 续期
 on:
   schedule:
     # 每 90 分钟执行一次（UTC 时间）
-    - cron: '*/90 * * * *'
+    - cron: '22 */3 * * *'
   workflow_dispatch:
     inputs:
       accounts:
