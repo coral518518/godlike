@@ -1,0 +1,70 @@
+name: CF Tunnel Setup
+
+on:
+  workflow_dispatch:
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Install cloudflared on Vultr
+        env:
+          VULTR_IP: ${{ secrets.VULTR_IP }}
+          VULTR_PASS: ${{ secrets.VULTR_PASS }}
+        run: |
+          set -ex
+          # 安装 sshpass
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq sshpass
+          
+          # SSH 连接到 Vultr 服务器
+          export SSHPASS="$VULTR_PASS"
+          
+          # 测试连接
+          sshpass -e ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 root@$VULTR_IP "uname -a"
+          
+          # 安装 cloudflared
+          sshpass -e ssh -o StrictHostKeyChecking=no root@$VULTR_IP 'bash -s' << 'SCRIPT'
+          set -ex
+          
+          # 检测架构
+          ARCH=$(uname -m)
+          if [ "$ARCH" = "x86_64" ]; then
+            CF_ARCH="cloudflared-linux-amd64"
+          elif [ "$ARCH" = "aarch64" ]; then
+            CF_ARCH="cloudflared-linux-arm64"
+          fi
+          
+          # 下载 cloudflared
+          wget -q "https://github.com/cloudflare/cloudflared/releases/latest/download/${CF_ARCH}" -O /usr/local/bin/cloudflared
+          chmod +x /usr/local/bin/cloudflared
+          
+          cloudflared --version
+          
+          # 启动 quick tunnel，转发本地 22 端口
+          # 先杀掉旧的
+          killall cloudflared 2>/dev/null || true
+          
+          # 启动隧道
+          nohup cloudflared tunnel --url tcp://localhost:22 > /tmp/cf_tunnel.log 2>&1 &
+          sleep 10
+          
+          # 提取隧道 URL
+          cat /tmp/cf_tunnel.log
+          
+          # 尝试提取 URL
+          TUNNEL_URL=$(grep -oP 'https://[^ ]+\.trycloudflare\.com' /tmp/cf_tunnel.log | head -1)
+          echo "TUNNEL_URL=$TUNNEL_URL"
+          
+          # 保存到文件方便后续读取
+          echo "$TUNNEL_URL" > /tmp/tunnel_url.txt
+          SCRIPT
+          
+      - name: Get tunnel URL
+        env:
+          VULTR_IP: ${{ secrets.VULTR_IP }}
+          VULTR_PASS: ${{ secrets.VULTR_PASS }}
+        run: |
+          export SSHPASS="$VULTR_PASS"
+          sshpass -e ssh -o StrictHostKeyChecking=no root@$VULTR_IP "cat /tmp/tunnel_url.txt; echo; cat /tmp/cf_tunnel.log | head -30"
