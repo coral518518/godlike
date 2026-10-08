@@ -2,8 +2,6 @@ name: Godlike 续期
 
 on:
   schedule:
-    # 每 3 小时执行一次（UTC 时间）
-    - cron: '33 2,4,6,8,10,12,14,16 * * *'
   workflow_dispatch:
 
 permissions:
