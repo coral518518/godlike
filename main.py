@@ -505,7 +505,7 @@ async def ws_start_server(socket_url: str, jwt: str) -> str:
             # ── 已在运行/启动中 → 跳过 ──
             if current_status in ("running", "starting"):
                 log(f"服务器已在运行中（{current_status}），无需开机")
-                return "already_running"
+                #return "already_running"
 
             # ── 发送开机指令 ──
             await ws.send(json.dumps({"event": "set state", "args": ["start"]}))
