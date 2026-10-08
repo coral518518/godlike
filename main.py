@@ -209,6 +209,7 @@ def login_and_get_token(user: str, pwd: str, proxy: str = None
             page.fill('input[placeholder="Username or Email"]', user)
             page.fill('input[placeholder="Password"]', pwd)
 
+            print(f"登录", flush=True)
             # 点击登录
             for sel in ['button[type="submit"]', 'button:has-text("Login")']:
                 try:
@@ -221,6 +222,7 @@ def login_and_get_token(user: str, pwd: str, proxy: str = None
 
             page.wait_for_timeout(5000)
 
+            print(f"处理登录后的引导页面", flush=True)
             # 处理登录后的引导页面
             for _ in range(5):
                 for sel in ['button:has-text("Go to my server")',
@@ -237,6 +239,7 @@ def login_and_get_token(user: str, pwd: str, proxy: str = None
                     break
                 page.wait_for_timeout(1000)
 
+            print(f"处理登录后的引导页面", flush=True)
             # 从 URL 中提取 short_id
             if not short_id and '/server/' in page.url:
                 parts = page.url.rstrip('/').split('/')
@@ -561,11 +564,9 @@ def process_account(account_str: str, label: str = "", proxy: str = None) -> boo
     label 仅用于日志标识。
     """
     raw = account_str.strip()
-    print(f" raw1 {raw}", flush=True)
     if not raw:
         return True  # 空账号跳过
 
-    print(f" raw2 {raw}", flush=True)
     # 解析 邮箱-----密码
     try:
         parts = raw.split("-----")
