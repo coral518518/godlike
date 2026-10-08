@@ -259,6 +259,10 @@ jobs:
           # 账号和 TG 凭据已硬编码在 main.py 中
           # 如需覆盖，可在 Secrets 中设置同名环境变量
           PROXY_SERVER: ${{ env.PROXY_SERVER }}
+          TG_BOT_TOKEN: ${{ env.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ env.TG_CHAT_ID }}
+          GODLIKE_1: ${{ env.GODLIKE_1 }}
+          
         run: python main.py
 
       - name: 上传截图
