@@ -1,7 +1,6 @@
 name: Godlike 续期
 
 on:
-  schedule:
   workflow_dispatch:
 
 permissions:
