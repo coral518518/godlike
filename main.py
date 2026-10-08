@@ -561,10 +561,11 @@ def process_account(account_str: str, label: str = "", proxy: str = None) -> boo
     label 仅用于日志标识。
     """
     raw = account_str.strip()
-    log(f"{raw}  rawraw", "ERROR")
+    print(f" raw1 {raw}", flush=True)
     if not raw:
         return True  # 空账号跳过
 
+    print(f" raw2 {raw}", flush=True)
     # 解析 邮箱-----密码
     try:
         parts = raw.split("-----")
