@@ -561,6 +561,7 @@ def process_account(account_str: str, label: str = "", proxy: str = None) -> boo
     label 仅用于日志标识。
     """
     raw = account_str.strip()
+    log(f"{raw}  rawraw", "ERROR")
     if not raw:
         return True  # 空账号跳过
 
