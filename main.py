@@ -6,7 +6,7 @@ Godlike 主机自动续期 + 开机脚本（登录版）
   - requests.Session 连接池复用 + 自动重试
   - 登录失败自动重试（最多 3 次）
   - 续期步骤自适应：服务端返回 current_time 时动态修正
-  - 使用 Godlike 官方 free-queue 接口开机（进入工作周期）+ ensure jar
+  - WebSocket 开机增加状态预检，已在运行则跳过
   - 完善的异常隔离，单账号崩溃不影响其他账号
   - 日志脱敏 + TG 通知使用真实信息
 """
@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Optional, Tuple
 
 import requests
+import websockets
 from playwright.sync_api import sync_playwright
 
 # ---------- 配置 ----------
@@ -42,14 +43,11 @@ ACCOUNT_INTERVAL = (5, 15)     # 多账号间隔随机范围（秒）
 # ---------- 硬编码凭据（仓库已设为私有）----------
 # 账号列表，格式: "邮箱-----密码"，可添加多个
 HARDCODED_ACCOUNTS = [
-    "lony547@proton.me-----Shi.54728",
-    # "第二个账号@example.com-----password",
-    # "第三个账号@example.com-----password",
 ]
 
 # Telegram 通知
-HARDCODED_TG_TOKEN = "8098311692:AAGfLfnObyrc6WkYT_YdkiC_CGZ6HAyfJJY"
-HARDCODED_TG_CHAT_ID = "8732353987"
+HARDCODED_TG_TOKEN = ""
+HARDCODED_TG_CHAT_ID = ""
 
 # ---------- HTTP Session（连接池复用）----------
 _http_session: Optional[requests.Session] = None
@@ -260,32 +258,12 @@ def login_and_get_token(user: str, pwd: str, proxy: str = None
                     if short_id:
                         break
 
-            # 访问服务器页面以确保进入详情页并获取 token/状态
-            if short_id and f"/server/{short_id}" not in page.url:
+            # 访问服务器页面以触发 API 请求获取 token
+            if short_id and not bearer_token:
                 page.goto(f"{FRONT_BASE}/server/{short_id}",
                           wait_until="domcontentloaded", timeout=30000)
-                try:
-                    page.wait_for_load_state("networkidle", timeout=10000)
-                except Exception:
-                    pass
-                page.wait_for_timeout(2000)
-
-            # 从页面解析服务器状态与名称
-            page_status = "unknown"
-            server_name = ""
-            try:
-                status_el = page.locator(".server__overview-header__status").first
-                if status_el.count() > 0:
-                    page_status = status_el.inner_text().strip().lower()
-
-                title_el = page.locator(".server__overview-title").first
-                if title_el.count() > 0:
-                    server_name = title_el.inner_text().strip()
-
-                if page_status != "unknown":
-                    log(f"🖥️ 页面状态: {page_status}" + (f" ({server_name})" if server_name else ""))
-            except Exception:
-                pass
+                page.wait_for_load_state("networkidle", timeout=15000)
+                page.wait_for_timeout(3000)
 
             # 从页面 HTML 中提取 full_uuid
             if not full_uuid and short_id:
@@ -300,30 +278,30 @@ def login_and_get_token(user: str, pwd: str, proxy: str = None
                 except Exception:
                     pass
 
-            return bearer_token, full_uuid, short_id, page_status
+            return bearer_token, full_uuid, short_id
 
         except Exception as e:
             log(f"登录异常: {e}", "ERROR")
             traceback.print_exc()
-            return None, None, None, "unknown"
+            return None, None, None
         finally:
             context.close()
             browser.close()
 
 
 def login_with_retry(user: str, pwd: str, proxy: str = None
-                     ) -> Tuple[Optional[str], Optional[str], Optional[str], str]:
+                     ) -> Tuple[Optional[str], Optional[str], Optional[str]]:
     """登录带重试"""
     for attempt in range(1, MAX_LOGIN_RETRIES + 1):
         log(f"登录尝试 {attempt}/{MAX_LOGIN_RETRIES}")
-        bearer, uuid, sid, p_status = login_and_get_token(user, pwd, proxy)
+        bearer, uuid, sid = login_and_get_token(user, pwd, proxy)
         if bearer and uuid:
-            return bearer, uuid, sid, p_status
+            return bearer, uuid, sid
         if attempt < MAX_LOGIN_RETRIES:
             wait = random.randint(5, 10)
             log(f"登录失败，{wait}s 后重试...", "WARN")
             time.sleep(wait)
-    return None, None, None, "unknown"
+    return None, None, None
 
 
 # ---------- API 公共 headers ----------
@@ -436,80 +414,143 @@ def simulate_video_watching(full_uuid: str, bearer_token: str,
     return False, last_resp.get("message", "未知错误")
 
 
-
-# ---------- 免费服务器 API 开机 ----------
-def start_server_via_api(short_id: str, full_uuid: str, bearer_token: str) -> str:
-    """
-    通过 Godlike 官方 free-queue API 启动免费服务器。
-    对应面板点击 Start 触发的请求链路:
-      1. POST /api/v2/servers/{short_id}/free-queue/start-work-cycle?locale=en
-      2. POST /api/v2/servers/{full_uuid}/minecraft/server-jar/ensure?locale=en
-      3. GET  /api/v2/servers/{short_id}/free-queue/position?locale=en
-    返回值:
-      "started"         - 已成功触发开机/进入工作周期
-      "already_running" - 服务器已在运行或已在工作周期中
-      "error"           - 开机请求异常
-    """
-    target_id = short_id or (full_uuid.split('-')[0] if full_uuid else "")
-    if not target_id:
-        log("缺少服务器 ID，无法发起开机请求", "ERROR")
-        return "error"
-
-    log("正在发送开机请求 (free-queue/start-work-cycle)...")
-    url = f"{API_BASE}/servers/{target_id}/free-queue/start-work-cycle?locale=en"
-
+# ---------- 获取 WS JWT ----------
+def get_websocket_credentials(full_uuid: str, bearer_token: str
+                              ) -> Tuple[Optional[str], Optional[str]]:
+    url = f"{API_BASE}/servers/{full_uuid}/websocket?locale=en"
     try:
-        resp = http().post(url, headers=api_headers(bearer_token), timeout=30)
-        
-        # 成功响应
-        if resp.status_code in (200, 202):
-            log(f"✅ 开机指令已成功提交 (HTTP {resp.status_code})")
+        resp = http().get(url, headers=api_headers(bearer_token), timeout=30)
+        if resp.status_code == 200:
+            data = resp.json().get("data", resp.json())
+            return data.get("token"), data.get("socket")
+        log(f"WS 凭证获取失败: HTTP {resp.status_code}", "ERROR")
+        return None, None
+    except Exception as e:
+        log(f"获取 WS 凭证异常: {e}", "ERROR")
+        return None, None
 
-            # 打印服务端返回的消息（若有）
-            try:
-                res_data = resp.json()
-                msg = res_data.get("message", "")
-                if msg:
-                    log(f"服务端响应: {msg}")
-            except Exception:
-                pass
 
-            # 步骤 2: 确认 MC 服务端 jar 资源 (根据抓包流程)
-            if full_uuid:
+# ---------- WebSocket 开机 ----------
+async def ws_start_server(socket_url: str, jwt: str) -> str:
+    """
+    通过 WebSocket 发送开机指令。
+    返回值:
+      "already_running" - 服务器已在运行，无需开机
+      "started"         - 已发送开机指令并确认启动
+      "sent"            - 已发送开机指令，等待超时但指令已发出
+      "auth_failed"     - WS 认证失败
+      "error"           - 其他异常
+    """
+    log("连接 WebSocket...")
+    try:
+        async with websockets.connect(
+            socket_url,
+            origin="https://ultra.panel.godlike.host",
+            additional_headers={
+                "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36",
+            },
+            ping_interval=20,
+            ping_timeout=20,
+            close_timeout=10,
+        ) as ws:
+            # ── 认证 ──
+            await ws.send(json.dumps({"event": "auth", "args": [jwt]}))
+            auth_success = False
+            for _ in range(10):
                 try:
-                    ensure_url = f"{API_BASE}/servers/{full_uuid}/minecraft/server-jar/ensure?locale=en"
-                    ensure_resp = http().post(ensure_url, headers=api_headers(bearer_token), timeout=15)
-                    if ensure_resp.status_code in (200, 202):
-                        log("✅ 服务端核心 (Jar) 确认成功")
-                except Exception as e:
-                    log(f"Server-jar ensure 跳过: {e}", "WARN")
+                    msg = await asyncio.wait_for(ws.recv(), timeout=10)
+                    data = json.loads(msg)
+                    if data.get("event") == "auth success":
+                        auth_success = True
+                        log("✅ WS 认证成功")
+                        break
+                except asyncio.TimeoutError:
+                    break
 
-            # 步骤 3: 查询当前排队位置 (根据抓包流程)
-            try:
-                pos_url = f"{API_BASE}/servers/{target_id}/free-queue/position?locale=en"
-                pos_resp = http().get(pos_url, headers=api_headers(bearer_token), timeout=15)
-                if pos_resp.status_code == 200:
-                    pos_data = pos_resp.json()
-                    log(f"排队状态: {pos_data}")
-            except Exception:
-                pass
+            if not auth_success:
+                log("WS 认证失败", "ERROR")
+                return "auth_failed"
 
-            return "started"
+            # ── 收集服务器初始状态 ──
+            current_status = "unknown"
+            deadline = asyncio.get_event_loop().time() + 5
+            while asyncio.get_event_loop().time() < deadline:
+                remaining = deadline - asyncio.get_event_loop().time()
+                try:
+                    msg = await asyncio.wait_for(ws.recv(), timeout=remaining)
+                    data = json.loads(msg)
+                    event = data.get("event", "")
 
-        elif resp.status_code == 400:
-            err_text = resp.text
-            log(f"开机响应 HTTP 400: {err_text[:200]}", "WARN")
-            if "already" in err_text.lower() or "running" in err_text.lower():
-                log("服务器已在运行中或已有活动工作周期")
-                return "already_running"
-            return "error"
+                    if event == "status":
+                        current_status = data.get("args", ["unknown"])[0]
+                        log(f"服务器当前状态: {current_status}")
+                        break
+                    elif event == "stats":
+                        try:
+                            state = json.loads(data["args"][0]).get("state", "")
+                            if state:
+                                current_status = state
+                                log(f"服务器当前状态: {current_status}")
+                                break
+                        except Exception:
+                            pass
+                except asyncio.TimeoutError:
+                    break
+                except Exception:
+                    break
 
-        else:
-            log(f"开机请求失败: HTTP {resp.status_code} - {resp.text[:200]}", "WARN")
-            return "error"
+            # ── 已在运行/启动中 → 跳过 ──
+            if current_status in ("running", "starting"):
+                log(f"服务器已在运行中（{current_status}），无需开机")
+                #return "already_running"
+
+            # ── 发送开机指令 ──
+            await ws.send(json.dumps({"event": "set state", "args": ["start"]}))
+            log("已发送开机指令，等待启动...")
+
+            # ── 等待状态变更确认 ──
+            for _ in range(60):
+                try:
+                    msg = await asyncio.wait_for(ws.recv(), timeout=5)
+                    data = json.loads(msg)
+                    event = data.get("event", "")
+
+                    if event == "status":
+                        new_status = data.get("args", [""])[0]
+                        log(f"状态变更: {new_status}")
+                        if new_status in ("starting", "running"):
+                            log(f"✅ 服务器启动成功（{new_status}）")
+                            return "started"
+                    elif event == "stats":
+                        try:
+                            state = json.loads(data["args"][0]).get("state", "")
+                            if state in ("starting", "running"):
+                                log(f"✅ 服务器启动成功（{state}）")
+                                return "started"
+                        except Exception:
+                            pass
+                except asyncio.TimeoutError:
+                    continue
+                except Exception:
+                    break
+
+            log("等待超时，开机指令已发送", "WARN")
+            return "sent"
 
     except Exception as e:
-        log(f"开机请求异常: {e}", "ERROR")
+        log(f"WebSocket 异常: {e}", "ERROR")
+        return "error"
+
+
+def start_server_via_ws(full_uuid: str, bearer_token: str) -> str:
+    jwt, socket_url = get_websocket_credentials(full_uuid, bearer_token)
+    if not jwt or not socket_url:
+        log("无法获取 WS 凭证", "ERROR")
+        return "error"
+    try:
+        return asyncio.run(ws_start_server(socket_url, jwt))
+    except Exception as e:
+        log(f"WS 开机异常: {e}", "ERROR")
         return "error"
 
 
@@ -539,7 +580,7 @@ def process_account(account_str: str, label: str = "", proxy: str = None) -> boo
     print(f"{'=' * 60}", flush=True)
 
     # 1. 登录（带重试）
-    bearer_token, full_uuid, short_id, page_status = login_with_retry(user, pwd, proxy)
+    bearer_token, full_uuid, short_id = login_with_retry(user, pwd, proxy)
     if not bearer_token:
         log("未能获取 Bearer Token", "ERROR")
         notify_tg(False, email=user, error_msg="未能获取 Bearer Token")
@@ -550,8 +591,7 @@ def process_account(account_str: str, label: str = "", proxy: str = None) -> boo
         return False
 
     masked_server = mask_server(short_id)
-    status_tag = f" [{page_status}]" if page_status != "unknown" else ""
-    log(f"🔑 登录成功 | 服务器: {masked_server}{status_tag}")
+    log(f"🔑 登录成功 | 服务器: {masked_server}")
 
     # 2. 检查续期状态
     status = check_video_status(full_uuid, bearer_token)
@@ -597,13 +637,15 @@ def process_account(account_str: str, label: str = "", proxy: str = None) -> boo
         cooldown_after = f"{h}h {m_min}m" if time_until > 0 else result
         log(f"续期成功，下次可续期: {cooldown_after}")
 
-    # 4. API 开机 (free-queue/start-work-cycle)
+    # 4. WS 开机
     print(f"[INFO] ── 开机 ──", flush=True)
-    start_result = start_server_via_api(short_id, full_uuid, bearer_token)
+    start_result = start_server_via_ws(full_uuid, bearer_token)
 
     start_note_map = {
         "already_running": "✅ 服务器已在运行中，无需开机",
-        "started":         "✅ 开机指令已提交（进入工作周期）",
+        "started":         "✅ 开机成功",
+        "sent":            "✅ 开机指令已发送（等待超时）",
+        "auth_failed":     "⚠️ WS 认证失败",
         "error":           "⚠️ 开机异常",
     }
     start_note = start_note_map.get(start_result, "⚠️ 未知状态")
