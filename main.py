@@ -167,9 +167,9 @@ def login_and_get_token(user: str, pwd: str, proxy: str = None
         nonlocal bearer_token, full_uuid, short_id
         # 拦截 Authorization header 中的 Bearer token
         auth = request.headers.get("authorization", "")
-        if auth.startswith("Bearer ") and "ptlc_" in auth:
+        if auth.startswith("Bearer "):
             token = auth.replace("Bearer ", "").strip()
-            if bearer_token != token:
+            if token and bearer_token != token:
                 bearer_token = token
         # 从 URL 中提取服务器 UUID
         url = request.url
@@ -222,33 +222,79 @@ def login_and_get_token(user: str, pwd: str, proxy: str = None
 
             page.wait_for_timeout(5000)
 
-            print(f"处理登录后的引导页面", flush=True)
-            # 处理登录后的引导页面
+            log("处理登录后的页面流程...")
+            # 1. 引导处理：如果有跳过/进入按钮，执行操作
             for _ in range(5):
-                for sel in ['button:has-text("Go to my server")',
-                            'button:has-text("Skip")']:
+                clicked = False
+                for sel in ['button:has-text("Skip")', 'button:has-text("Go to my server")',
+                            'button:has-text("Next")']:
                     try:
                         el = page.locator(sel)
                         if el.count() > 0 and el.first.is_visible():
+                            log(f"点击引导/跳转按钮: {sel}")
                             el.first.click()
-                            page.wait_for_timeout(2000)
+                            page.wait_for_timeout(1500)
+                            clicked = True
                             break
                     except Exception:
                         pass
-                if '/server/' in page.url:
+                if '/server/' in page.url or page.locator('.dashboard').count() > 0:
                     break
-                page.wait_for_timeout(1000)
+                if not clicked:
+                    page.wait_for_timeout(1000)
 
-            print(f"处理登录后的引导页面", flush=True)
-            # 从 URL 中提取 short_id
-            if not short_id and '/server/' in page.url:
+            # 2. 判断是否需要进入首页，若未在详情页或仪表盘则进入首页并等待完成
+            if '/server/' not in page.url:
+                if not page.url.startswith(FRONT_BASE) or '/login' in page.url:
+                    log(f"当前 URL: {page.url}，进入首页: {FRONT_BASE}/")
+                    page.goto(f"{FRONT_BASE}/", wait_until="domcontentloaded", timeout=30000)
+
+                log("等待页面加载完成...")
+                try:
+                    page.wait_for_load_state("domcontentloaded", timeout=15000)
+                    page.wait_for_timeout(2000)
+                except Exception:
+                    pass
+
+                # 3. 在 .dashboard 下面的 html 找 .server__title 点击进入详情页
+                try:
+                    page.locator(".dashboard").wait_for(state="visible", timeout=15000)
+                    log("已检测到 .dashboard")
+                except Exception:
+                    log("未检测到 .dashboard，尝试直接查找 .server__title", "WARN")
+
+                server_title = page.locator(".dashboard .server__title").first
+                if not server_title.is_visible():
+                    server_title = page.locator(".server__title").first
+
+                if server_title.is_visible():
+                    try:
+                        title_text = server_title.inner_text().strip()
+                        log(f"找到服务器: {title_text}，点击进入详情页...")
+                        server_title.click()
+                        try:
+                            page.wait_for_url("**/server/**", timeout=15000)
+                        except Exception:
+                            pass
+                    except Exception as e:
+                        log(f"点击 .server__title 异常: {e}", "WARN")
+                else:
+                    log("未找到 .server__title 服务器卡片", "WARN")
+
+            # 4. 等待详情页网络请求以捕获 token 和 uuid
+            page.wait_for_timeout(3000)
+
+            # 提取 short_id
+            if '/server/' in page.url:
                 parts = page.url.rstrip('/').split('/')
                 for i, part in enumerate(parts):
-                    if part == 'server' and i + 1 < len(parts) and len(parts[i + 1]) == 8:
-                        short_id = parts[i + 1]
-                        break
+                    if part == 'server' and i + 1 < len(parts):
+                        candidate = parts[i + 1].split('?')[0].split('#')[0]
+                        if len(candidate) == 8:
+                            short_id = candidate
+                            break
 
-            # 从链接中提取 short_id
+            # 回退：从链接中提取 short_id
             if not short_id:
                 links = page.locator('a[href*="/server/"]')
                 for i in range(links.count()):
@@ -261,14 +307,17 @@ def login_and_get_token(user: str, pwd: str, proxy: str = None
                     if short_id:
                         break
 
-            # 访问服务器页面以触发 API 请求获取 token
+            log(f"提取到 short_id: {short_id}")
+
+            # 5. 若已进入详情页但 token 仍未获取，尝试访问详情页触发 API 请求
             if short_id and not bearer_token:
-                page.goto(f"{FRONT_BASE}/server/{short_id}",
-                          wait_until="domcontentloaded", timeout=30000)
+                if f"/server/{short_id}" not in page.url:
+                    page.goto(f"{FRONT_BASE}/server/{short_id}",
+                              wait_until="domcontentloaded", timeout=30000)
                 page.wait_for_load_state("networkidle", timeout=15000)
                 page.wait_for_timeout(3000)
 
-            # 从页面 HTML 中提取 full_uuid
+            # 6. 从页面 HTML 中提取 full_uuid（兜底）
             if not full_uuid and short_id:
                 try:
                     html_content = page.content()
@@ -281,6 +330,7 @@ def login_and_get_token(user: str, pwd: str, proxy: str = None
                 except Exception:
                     pass
 
+            log(f"登录凭据: Token={'已获取' if bearer_token else '未获取'}, UUID={full_uuid}, short_id={short_id}")
             return bearer_token, full_uuid, short_id
 
         except Exception as e:
